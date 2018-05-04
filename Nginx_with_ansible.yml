@@ -1,0 +1,168 @@
+---
+
+- name: Compile NGINX from sources
+  hosts: localhost
+  become: true
+  vars:
+    nginx_version: nginx-1.13.4
+    nginx_tarball_url: "http://nginx.org/download/{{ nginx_version }}.tar.gz"
+    nginx_install_dir: "/tmp/{{ nginx_version }}"
+    nginx_sbin_path: "/usr/sbin/nginx"
+    nginx_conf_path: "/etc/nginx/nginx.conf"
+    nginx_custom_modules: "--with-http_auth_request_module --with-http"
+    nps_version: "1.13.35.2"
+    build_dir: "/tmp/build-nginx-pagespeed"
+    nps_release: "{{nps_version}}-beta"
+    psol_version: "{{nps_release/beta/}}"
+
+  tasks:
+  - name: Installing NGINX Dependencies
+    become: yes
+    apt:
+      name: "{{ item }}"
+      update_cache: yes
+    with_items:
+      - libssl-dev
+      - zlib1g-dev
+      - libpcre3
+      - libpcre3-dev
+      - unzip
+
+  - name: Downloading NGINX sources
+    get_url:
+      url: "{{ nginx_tarball_url }}"
+      dest: "/tmp/{{ nginx_version }}.tar.gz"
+    register: nginx_source
+
+  - name: Unpacking NGINX
+    unarchive:
+      copy: no
+      dest: /tmp/
+      src: "{{ nginx_source.dest }}"
+    when: nginx_source.changed
+    register: nginx_source_unpack
+
+  - name: Check if nginx is installed
+    stat: path=/usr/sbin/nginx
+    register: sbin_nginx
+
+  - name: Create required Nginx dirs
+    become: yes
+    file:
+      path: /etc/nginx
+      state: directory
+      owner: root
+      mode: 0755
+
+
+###################Download and build pagespeed for nginx########################################
+  - name: Create build dir
+    file: path="{{build_dir}}" state=directory
+   
+  - name: Download PageSpeed
+#   get_url: url=https://github.com/pagespeed/ngx_pagespeed/archive/{{nps_release}}.zip dest={{build_dir}}/{{nps_release}}.zip
+    get_url: url=https://github.com/apache/incubator-pagespeed-ngx/archive/v{{nps_release}}.zip dest={{build_dir}}/{{nps_release}}.zip
+    register: get_pagespeed
+
+# Fails with permission error when using /root, possibly due to Ansible 1.9.x bug https://github.com/ansible/ansible-modules-core/issues/932
+  - name: Unarchive PageSpeed
+    unarchive:
+      copy: no 
+      src: "{{build_dir}}/{{nps_release}}.zip "
+      dest: "{{build_dir}}"
+    when: get_pagespeed.changed
+
+#  - name: Unzip PageSpeed
+#    command: unzip {{build_dir}}/{{nps_release}}.zip -d {{build_dir}}
+
+#  - name: Download PageSpeed Optimization Libraries
+#    get_url: url=https://dl.google.com/dl/page-speed/psol/{{psol_version}}.tar.gz dest={{build_dir}}/ngx_pagespeed-{{nps_release}}
+
+#  - name: Untar PSOL
+#    command: tar -xzvf {{build_dir}}/ngx_pagespeed-{{nps_release}}/{{nps_version}}.tar.gz -C {{build_dir}}/ngx_pagespeed-{{nps_release}}
+
+#  - name: Create PSOL folder
+#    file: path={{build_dir}}/{{nps_release}}/psol state=directory mode=0755
+
+#  - name: Unarchive PSOL
+#    unarchive: src={{build_dir}}/ngx_pagespeed-{{nps_release}}/{{nps_version}}.tar.gz dest={{build_dir}}/ngx_pagespeed-{{nps_release}} copy=no
+
+
+################################################ Build nginx with pagespeed  #############################################
+  - name: Configuring NGINX source with custom modules
+    command: "./configure --add-module={{build_dir}}/ngx_pagespeed-{{nps_release}} --sbin-path={{ nginx_sbin_path }} --conf-path={{ nginx_conf_path }} {{ nginx_custom_modules }}"
+    args:
+      chdir: "{{ nginx_install_dir }}"
+    when: nginx_source_unpack|changed
+    register: nginx_configure
+
+  - name: Installing NGINX
+    become: yes
+    shell: make && make install
+    args:
+      chdir: "{{ nginx_install_dir }}"
+    when: nginx_configure|changed
+
+  - name: Creating NGINX conf file
+    become: yes
+    template:
+      src: "{{ nginx_install_dir }}/conf/nginx.conf"
+      dest: "{{ nginx_conf_path }}"
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+      mode: 0644
+
+  - name: Installing NGINX init script (service)
+    become: yes
+    template:
+      src: nginx.init
+      dest: /etc/init.d/nginx
+      owner: root
+      group: root
+      mode: 0755
+    notify:
+      - restart nginx
+
+  - name: Nginx Configure Systemd | Test if we are using systemd
+    shell: "if [ -d /lib/systemd ] ; then echo 'true' ; else echo 'false' ; fi"
+#    shell: "if [ -d /lib/systemd/system ] ; then echo 'true' ; else echo 'false' ; fi"
+    register: have_systemd
+  - debug: var=have_systemd.stdout
+
+  - name: Nginx Configure Systemd | Install the systemd script if using systemd
+    template:
+      src: nginx.service.systemd
+      dest: /lib/systemd/system/nginx.service
+      owner: root
+      group: root
+      mode: 0644
+#    when: "{{ have_systemd == 'true' }}"
+    when: have_systemd.stdout == 'true'
+    notify:
+      - restart nginx
+
+  - name: Create Systemd symlink for nginx
+    file: 
+      dest: "/etc/systemd/system/nginx.service"
+      src: "/lib/systemd/system/nginx.service"
+      state: link 
+      force: yes
+    when: "{{ have_systemd.stdout == 'true' }}"
+    notify: 
+      - restart nginx
+
+  - name: Nginx Configure | Reload scripts if using systemd
+    shell: "systemctl daemon-reload"
+    when: "{{ have_systemd.stdout == 'true' }}"
+
+  - name: Nginx Configure | Register Nginx as a service
+    service:
+      name: nginx
+      enabled: yes
+
+  - name: Starting NGINX
+    become: yes
+    service:
+      name: nginx
+      state: started
+
